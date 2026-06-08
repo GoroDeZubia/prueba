@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Fetches popular movies from the YTS public API (no scraping, no browser needed),
-queries OMDB to enrich data, and sends an HTML email with a sorted table.
+Fetches top-100 movie torrents from The Pirate Bay (apibay.org),
+enriches data via OMDB, and sends an HTML email with a sorted table.
 """
 
 import os
-import re
 import time
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -19,8 +18,8 @@ load_dotenv()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-YTS_API      = "https://yts.mx/api/v2/list_movies.json"
-YTS_LIMIT    = 20       # how many movies to fetch
+TPB_TOP100   = "https://apibay.org/precompiled/data_top100_201.json"  # cat 201 = Movies
+TOP_N        = 20       # how many movies to include in the email
 OMDB_API_KEY = os.environ["OMDB_API_KEY"]
 
 SMTP_HOST  = "smtp.gmail.com"
@@ -44,37 +43,39 @@ HEADERS = {
 
 def fetch_popular_movies() -> List[Dict]:
     """
-    Returns a list of dicts with: title, year, imdb_id, imdb_rating, genre.
-    Source: YTS public API sorted by number of peers (most active torrents).
+    Fetches the TPB top-100 movies list (apibay.org), deduplicates by IMDb ID,
+    and returns the TOP_N most-seeded entries for OMDB enrichment.
     """
-    params = {
-        "sort_by":       "peers",
-        "order_by":      "desc",
-        "limit":         YTS_LIMIT,
-        "minimum_rating": 0,
-    }
-    resp = requests.get(YTS_API, params=params, headers=HEADERS, timeout=15)
+    resp = requests.get(TPB_TOP100, headers=HEADERS, timeout=15)
     resp.raise_for_status()
-    data = resp.json()
+    torrents = resp.json()
 
-    if data.get("status") != "ok":
-        raise RuntimeError(f"YTS API error: {data.get('status_message')}")
+    # Keep only entries with a valid IMDb ID, sort by seeders descending
+    torrents = [t for t in torrents if t.get("imdb") and t["imdb"] != "None"]
+    torrents.sort(key=lambda t: -int(t.get("seeders", 0)))
 
-    movies = []
-    for m in data["data"].get("movies") or []:
+    movies: List[Dict] = []
+    seen: set = set()
+    for t in torrents:
+        imdb_id = t["imdb"]
+        if imdb_id in seen:
+            continue          # same movie, different torrent quality
+        seen.add(imdb_id)
         movies.append({
-            "title":       m.get("title", ""),
-            "year":        str(m.get("year", "")),
-            "imdb_id":     m.get("imdb_code", ""),
-            "imdb_rating": str(m.get("rating", "N/A")),
-            "genre":       ", ".join(m.get("genres") or []),
+            "title":       t.get("name", ""),   # raw torrent name; OMDB will replace it
+            "year":        "",
+            "imdb_id":     imdb_id,
+            "imdb_rating": "N/A",
+            "genre":       "",
         })
+        if len(movies) >= TOP_N:
+            break
     return movies
 
 # ── OMDB enrichment (fills in missing ratings / genre) ───────────────────────
 
 def enrich_with_omdb(movie: Dict) -> Dict:
-    """Query OMDB by IMDb ID to get accurate rating and genre."""
+    """Query OMDB by IMDb ID to fill in title, year, rating, and genre."""
     if not movie["imdb_id"]:
         return movie
     try:
@@ -85,8 +86,10 @@ def enrich_with_omdb(movie: Dict) -> Dict:
             timeout=10,
         ).json()
         if data.get("Response") == "True":
-            movie["imdb_rating"] = data.get("imdbRating", movie["imdb_rating"])
-            movie["genre"]       = data.get("Genre",      movie["genre"])
+            movie["title"]       = data.get("Title",      movie["title"])
+            movie["year"]        = data.get("Year",        movie["year"])
+            movie["imdb_rating"] = data.get("imdbRating",  movie["imdb_rating"])
+            movie["genre"]       = data.get("Genre",       movie["genre"])
     except Exception:
         pass
     return movie
