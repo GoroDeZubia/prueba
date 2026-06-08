@@ -24,6 +24,7 @@ jobs:
 
       - name: Run movie scraper
         env:
+          TMDB_API_KEY:   ${{ secrets.TMDB_API_KEY }}
           OMDB_API_KEY:   ${{ secrets.OMDB_API_KEY }}
           GMAIL_USER:     ${{ secrets.GMAIL_USER }}
           GMAIL_PASSWORD: ${{ secrets.GMAIL_PASSWORD }}
