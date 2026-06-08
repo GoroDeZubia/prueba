@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
 """
-Fetches popular movies from The Movie Database (TMDb) API,
-enriches with IMDb ratings via OMDB, and sends an HTML email.
+Scrapes the 'Most Popular Torrents' section from 1337x homepage,
+queries OMDB for IMDb ratings, and sends an HTML email.
 """
 
+import json
 import os
+import platform
+import re
 import time
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
+import undetected_chromedriver as uc
 from dotenv import load_dotenv
 import requests
+from bs4 import BeautifulSoup
 
 load_dotenv()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-TMDB_BASE    = "https://api.themoviedb.org/3"
-TMDB_API_KEY = os.environ["TMDB_API_KEY"]
+SCRAPE_URL   = "https://1337x.unblockninja.st"
 OMDB_API_KEY = os.environ["OMDB_API_KEY"]
-TOP_N        = 20
 
 SMTP_HOST  = "smtp.gmail.com"
 SMTP_PORT  = 587
@@ -32,87 +35,171 @@ EMAIL_TO   = os.environ.get("EMAIL_TO") or SMTP_USER
 
 OMDB_DELAY = 0.25
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-}
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
 
-# ── Fetch popular movies from TMDb ────────────────────────────────────────────
+# ── ChromeDriver path ─────────────────────────────────────────────────────────
+# On Linux CI: the workflow copies chromedriver to /tmp/uc_driver before running.
+# On macOS dev: use the manually downloaded binary.
 
-def _genre_map() -> Dict[int, str]:
-    resp = requests.get(
-        f"{TMDB_BASE}/genre/movie/list",
-        params={"api_key": TMDB_API_KEY, "language": "en-US"},
-        headers=HEADERS,
-        timeout=10,
-    )
-    resp.raise_for_status()
-    return {g["id"]: g["name"] for g in resp.json()["genres"]}
+if platform.system() == "Linux":
+    CHROMEDRIVER_PATH = "/tmp/uc_driver"
+else:
+    CHROMEDRIVER_PATH = "/tmp/chromedriver-mac-x64/chromedriver"
+
+COOKIES_FILE = ".cf_cookies.json"
+
+# ── Title cleaning ────────────────────────────────────────────────────────────
+
+_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+_STOP_RE = re.compile(
+    r"\b("
+    r"1080p|720p|2160p|4[Kk]|480p|"
+    r"BluRay|BDRip|BRRip|WEB[.\-]?DL|WEBRip|HDRip|DVDRip|HDTV|AMZN|NF|HULU|DSNP|IMAX|"
+    r"x264|x265|HEVC|AVC|H\.?264|H\.?265|XviD|DivX|"
+    r"AC3|DTS(?:[-.]HD)?|AAC|MP3|DD5\.1|TrueHD|Atmos|EAC3|DDP5\.1|"
+    r"EXTENDED|THEATRICAL|REMASTERED|PROPER|REPACK|UNRATED|DUBBED|SUBBED|"
+    r"HDR10\+?|SDR|DoVi"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
-def fetch_popular_movies() -> List[Dict]:
+def clean_title(raw: str) -> Tuple[str, Optional[str]]:
+    text = raw.replace(".", " ").replace("_", " ")
+    year_match = _YEAR_RE.search(text)
+    year       = year_match.group() if year_match else None
+    year_pos   = year_match.start() if year_match else len(text)
+    stop_match = _STOP_RE.search(text)
+    stop_pos   = stop_match.start() if stop_match else len(text)
+    cut        = min(year_pos, stop_pos)
+    title      = re.sub(r"\s+", " ", text[:cut]).strip()
+    if not title:
+        title = " ".join(text.split()[:5])
+    return title, year
+
+# ── Selenium scraping ─────────────────────────────────────────────────────────
+
+def _make_driver(headless: bool) -> uc.Chrome:
+    options = uc.ChromeOptions()
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1280,800")
+    kwargs: Dict = {
+        "options":              options,
+        "use_subprocess":       True,
+        "headless":             headless,
+    }
+    if os.path.exists(CHROMEDRIVER_PATH):
+        kwargs["driver_executable_path"] = CHROMEDRIVER_PATH
+    return uc.Chrome(**kwargs)
+
+
+def _cf_resolved(driver: uc.Chrome) -> bool:
+    t = driver.title.lower()
+    return "moment" not in t and "checking" not in t and "verify" not in t
+
+
+def _wait_cf(driver: uc.Chrome, timeout: int = 35) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _cf_resolved(driver):
+            time.sleep(1.5)
+            return True
+        time.sleep(1)
+    return False
+
+
+def _load_cookies() -> List[Dict]:
+    if os.path.exists(COOKIES_FILE):
+        with open(COOKIES_FILE) as f:
+            return json.load(f)
+    return []
+
+
+def _save_cookies(driver: uc.Chrome) -> None:
+    with open(COOKIES_FILE, "w") as f:
+        json.dump(driver.get_cookies(), f)
+
+
+def scrape_titles(url: str) -> List[str]:
     """
-    Returns TOP_N popular movies from TMDb with title, year, genre,
-    tmdb_id, and tmdb_rating. OMDB enrichment adds imdb_id and imdb_rating.
+    Opens 1337x with undetected Chrome, waits for Cloudflare to clear,
+    and extracts movie titles from the 'Most Popular Torrents' section.
+    Tries headless first (using saved cookies); falls back to visible window.
     """
-    genres = _genre_map()
+    base_url = "/".join(url.split("/")[:3])
+    saved    = _load_cookies()
+    html     = ""
 
-    resp = requests.get(
-        f"{TMDB_BASE}/movie/popular",
-        params={"api_key": TMDB_API_KEY, "language": "en-US", "page": 1},
-        headers=HEADERS,
-        timeout=10,
-    )
-    resp.raise_for_status()
+    for headless in ([True, False] if saved else [False]):
+        driver = _make_driver(headless)
+        try:
+            if saved and headless:
+                driver.get(base_url)
+                time.sleep(1)
+                for c in saved:
+                    try:
+                        driver.add_cookie(c)
+                    except Exception:
+                        pass
 
-    movies = []
-    for m in resp.json().get("results", [])[:TOP_N]:
-        genre_names = ", ".join(genres[gid] for gid in m.get("genre_ids", []) if gid in genres)
-        movies.append({
-            "title":       m.get("title", ""),
-            "year":        (m.get("release_date") or "")[:4],
-            "tmdb_id":     str(m["id"]),
-            "imdb_id":     "",
-            "imdb_rating": str(round(m.get("vote_average", 0), 1)),
-            "genre":       genre_names,
-        })
-    return movies
+            driver.get(url)
 
-# ── OMDB enrichment ───────────────────────────────────────────────────────────
+            if not _wait_cf(driver, timeout=35):
+                print("  [!] Cloudflare not resolved" + (" — retrying visibly" if headless else ""))
+                continue
 
-def enrich_with_omdb(movie: Dict) -> Dict:
-    """
-    Queries OMDB by title + year to get the IMDb ID and IMDb rating.
-    Falls back to the TMDb rating if OMDB doesn't find the movie.
-    """
+            _save_cookies(driver)
+            html = driver.page_source
+            break
+        finally:
+            driver.quit()
+
+    if not html:
+        raise RuntimeError("Could not load page — Cloudflare challenge not resolved.")
+
+    soup   = BeautifulSoup(html, "html.parser")
+    strong = soup.find("strong", string=lambda t: t and "Most Popular Torrents" in t)
+    if not strong:
+        raise RuntimeError("'Most Popular Torrents' section not found on page.")
+    featured = strong.parent.parent
+
+    titles = []
+    for td in featured.select("td.name"):
+        links = td.find_all("a")
+        if len(links) < 2:
+            continue
+        if "/sub/movies/" not in links[0].get("href", ""):
+            continue
+        titles.append(links[1].get_text(strip=True))
+    return titles
+
+# ── OMDB lookup ───────────────────────────────────────────────────────────────
+
+def get_omdb_info(title: str, year: Optional[str]) -> Dict:
+    params: dict = {"t": title, "apikey": OMDB_API_KEY}
+    if year:
+        params["y"] = year
     try:
-        data = requests.get(
-            "https://www.omdbapi.com/",
-            params={"t": movie["title"], "y": movie["year"], "apikey": OMDB_API_KEY},
-            headers=HEADERS,
-            timeout=10,
-        ).json()
+        data = requests.get("https://www.omdbapi.com/", params=params, headers=HEADERS, timeout=10).json()
         if data.get("Response") == "True":
-            movie["imdb_id"]     = data.get("imdbID", "")
-            movie["imdb_rating"] = data.get("imdbRating", movie["imdb_rating"])
-            movie["genre"]       = data.get("Genre", movie["genre"])
+            return {
+                "imdb_rating": data.get("imdbRating", "N/A"),
+                "imdb_id":     data.get("imdbID", ""),
+                "genre":       data.get("Genre", ""),
+                "year":        data.get("Year", year or ""),
+            }
     except Exception:
         pass
-    return movie
+    return {"imdb_rating": "N/A", "imdb_id": "", "genre": "", "year": year or ""}
 
 # ── HTML email ────────────────────────────────────────────────────────────────
 
 def _rating_color(rating: str) -> str:
     try:
         r = float(rating)
-        if r >= 7.0:
-            return "#27ae60"
-        if r >= 5.0:
-            return "#e67e22"
-        return "#e74c3c"
+        return "#27ae60" if r >= 7.0 else "#e67e22" if r >= 5.0 else "#e74c3c"
     except ValueError:
         return "#888888"
 
@@ -122,16 +209,12 @@ def build_html(movies: List[Dict]) -> str:
     for i, m in enumerate(movies, 1):
         color = _rating_color(m["imdb_rating"])
         bg    = "#f9f9f9" if i % 2 == 0 else "#ffffff"
-
-        # Link to IMDb if we have the id, otherwise to TMDb
-        if m["imdb_id"]:
-            link = f"https://www.imdb.com/title/{m['imdb_id']}/"
-        else:
-            link = f"https://www.themoviedb.org/movie/{m['tmdb_id']}"
-
-        rating_cell = (
-            f'<a href="{link}" style="color:{color};font-weight:bold;text-decoration:none;">'
+        imdb_cell = (
+            f'<a href="https://www.imdb.com/title/{m["imdb_id"]}/" '
+            f'style="color:{color};font-weight:bold;text-decoration:none;">'
             f'{m["imdb_rating"]} &#9733;</a>'
+            if m["imdb_id"]
+            else f'<span style="color:{color};">{m["imdb_rating"]}</span>'
         )
         rows += (
             f'<tr style="background:{bg};">'
@@ -139,7 +222,7 @@ def build_html(movies: List[Dict]) -> str:
             f'<td style="padding:10px 14px;font-weight:500;">{m["title"]}</td>'
             f'<td style="padding:10px 14px;color:#888;">{m["year"]}</td>'
             f'<td style="padding:10px 14px;color:#999;font-size:12px;">{m["genre"]}</td>'
-            f'<td style="padding:10px 14px;text-align:center;">{rating_cell}</td>'
+            f'<td style="padding:10px 14px;text-align:center;">{imdb_cell}</td>'
             f'</tr>'
         )
 
@@ -149,14 +232,12 @@ def build_html(movies: List[Dict]) -> str:
 <body style="font-family:Arial,sans-serif;background:#f0f2f5;padding:24px;margin:0;">
   <div style="max-width:840px;margin:0 auto;background:#fff;border-radius:10px;
               box-shadow:0 2px 12px rgba(0,0,0,.12);overflow:hidden;">
-
     <div style="background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);padding:28px 32px;">
-      <h1 style="margin:0;color:#e94560;font-size:22px;">&#127909; Popular Movies This Week</h1>
+      <h1 style="margin:0;color:#e94560;font-size:22px;">&#127909; Most Popular Torrents</h1>
       <p style="margin:6px 0 0;color:#aaa;font-size:13px;">
-        Source: TMDb &mdash; Ratings: IMDb via OMDB &mdash; sorted by rating
+        Source: 1337x &mdash; Ratings: IMDb via OMDB &mdash; sorted by rating
       </p>
     </div>
-
     <div style="padding:20px 24px;overflow-x:auto;">
       <table style="width:100%;border-collapse:collapse;font-size:14px;">
         <thead>
@@ -171,10 +252,9 @@ def build_html(movies: List[Dict]) -> str:
         <tbody>{rows}</tbody>
       </table>
     </div>
-
     <div style="padding:14px 24px;background:#f9f9f9;border-top:1px solid #eee;
                 font-size:11px;color:#bbb;text-align:center;">
-      Generated automatically &middot; Source: TMDb &middot; Ratings: IMDb via OMDB
+      Generated automatically &middot; Data from OMDB API
     </div>
   </div>
 </body>
@@ -182,7 +262,7 @@ def build_html(movies: List[Dict]) -> str:
 
 # ── Email ─────────────────────────────────────────────────────────────────────
 
-def send_email(html: str, subject: str = "🎬 Popular Movies This Week") -> None:
+def send_email(html: str, subject: str = "🎬 Most Popular Torrents") -> None:
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"]    = EMAIL_FROM
@@ -198,22 +278,29 @@ def send_email(html: str, subject: str = "🎬 Popular Movies This Week") -> Non
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    print("Fetching popular movies from TMDb...")
-    movies = fetch_popular_movies()
-    print(f"  Got {len(movies)} movies\n")
+    print(f"Scraping: {SCRAPE_URL}")
+    raw_titles = scrape_titles(SCRAPE_URL)
+    print(f"  Found {len(raw_titles)} movies\n")
 
-    print("Enriching with OMDB ratings...")
-    for m in movies:
-        print(f"  {m['title']} ({m['year']})")
-        enrich_with_omdb(m)
+    movies = []
+    for raw in raw_titles:
+        title, year = clean_title(raw)
+        print(f"  [{year or '????'}] {title!r}")
+        info = get_omdb_info(title, year)
+        movies.append({
+            "title":       title,
+            "year":        info["year"] or year or "—",
+            "imdb_rating": info["imdb_rating"],
+            "imdb_id":     info["imdb_id"],
+            "genre":       info["genre"],
+        })
         time.sleep(OMDB_DELAY)
 
     movies.sort(key=lambda m: (
-        m["imdb_rating"] in ("N/A", "0.0", ""),
-        -float(m["imdb_rating"]) if m["imdb_rating"] not in ("N/A", "0.0", "") else 0,
+        m["imdb_rating"] == "N/A",
+        -float(m["imdb_rating"]) if m["imdb_rating"] != "N/A" else 0,
     ))
 
-    print("\nBuilding email...")
     html = build_html(movies)
     with open("preview.html", "w", encoding="utf-8") as f:
         f.write(html)

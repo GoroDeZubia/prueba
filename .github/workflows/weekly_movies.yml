@@ -22,9 +22,26 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Install Chrome and ChromeDriver
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Copy ChromeDriver to writable location
+        # undetected-chromedriver needs to patch the binary — it must be in a
+        # directory the runner user owns. /tmp is always writable.
+        run: |
+          cp "$(which chromedriver)" /tmp/uc_driver
+          chmod 755 /tmp/uc_driver
+
+      - name: Start virtual display
+        # Chrome runs in non-headless mode to pass Cloudflare Turnstile.
+        # Xvfb provides a virtual screen so it doesn't need a real display.
+        run: |
+          sudo apt-get install -y xvfb
+          Xvfb :99 -screen 0 1280x800x24 &
+          echo "DISPLAY=:99" >> $GITHUB_ENV
+
       - name: Run movie scraper
         env:
-          TMDB_API_KEY:   ${{ secrets.TMDB_API_KEY }}
           OMDB_API_KEY:   ${{ secrets.OMDB_API_KEY }}
           GMAIL_USER:     ${{ secrets.GMAIL_USER }}
           GMAIL_PASSWORD: ${{ secrets.GMAIL_PASSWORD }}
