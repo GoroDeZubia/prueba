@@ -1,29 +1,26 @@
 #!/usr/bin/env python3
 """
-Scrapes 1337x movie listings, queries OMDB for IMDb ratings,
-and sends an HTML email with a sorted results table.
+Fetches popular movies from the YTS public API (no scraping, no browser needed),
+queries OMDB to enrich data, and sends an HTML email with a sorted table.
 """
 
-import json
 import os
 import re
-import shutil
 import time
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-import undetected_chromedriver as uc
 from dotenv import load_dotenv
 import requests
-from bs4 import BeautifulSoup
 
 load_dotenv()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-SCRAPE_URL   = "https://1337x.unblockninja.st"
+YTS_API      = "https://yts.mx/api/v2/list_movies.json"
+YTS_LIMIT    = 20       # how many movies to fetch
 OMDB_API_KEY = os.environ["OMDB_API_KEY"]
 
 SMTP_HOST  = "smtp.gmail.com"
@@ -33,200 +30,66 @@ SMTP_PASS  = (os.environ.get("GMAIL_APP_PASS") or os.environ.get("GMAIL_PASSWORD
 EMAIL_FROM = SMTP_USER
 EMAIL_TO   = os.environ.get("EMAIL_TO") or SMTP_USER
 
-OMDB_DELAY = 0.3   # seconds between requests (free tier: 1 000 req/day)
+OMDB_DELAY = 0.25   # seconds between OMDB requests (free tier: 1 000 req/day)
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Cache-Control": "max-age=0",
+    )
 }
 
-# ── Title cleaning ────────────────────────────────────────────────────────────
+# ── Fetch popular movies ──────────────────────────────────────────────────────
 
-_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
-
-# Any token that marks the start of technical metadata (not the movie title)
-_STOP_RE = re.compile(
-    r"\b("
-    r"1080p|720p|2160p|4[Kk]|480p|"
-    r"BluRay|BDRip|BRRip|WEB[.\-]?DL|WEBRip|HDRip|DVDRip|HDTV|AMZN|NF|HULU|DSNP|IMAX|"
-    r"x264|x265|HEVC|AVC|H\.?264|H\.?265|XviD|DivX|"
-    r"AC3|DTS(?:[-.]HD)?|AAC|MP3|DD5\.1|TrueHD|Atmos|EAC3|DDP5\.1|"
-    r"EXTENDED|THEATRICAL|REMASTERED|PROPER|REPACK|UNRATED|DUBBED|SUBBED|"
-    r"HDR10\+?|SDR|DoVi"
-    r")\b",
-    re.IGNORECASE,
-)
-
-
-def clean_title(raw: str) -> Tuple[str, Optional[str]]:
+def fetch_popular_movies() -> List[Dict]:
     """
-    'The.Dark.Knight.2008.1080p.BluRay.x264-GROUP'
-    → ('The Dark Knight', '2008')
+    Returns a list of dicts with: title, year, imdb_id, imdb_rating, genre.
+    Source: YTS public API sorted by number of peers (most active torrents).
     """
-    text = raw.replace(".", " ").replace("_", " ")
+    params = {
+        "sort_by":       "peers",
+        "order_by":      "desc",
+        "limit":         YTS_LIMIT,
+        "minimum_rating": 0,
+    }
+    resp = requests.get(YTS_API, params=params, headers=HEADERS, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
 
-    year_match = _YEAR_RE.search(text)
-    year       = year_match.group() if year_match else None
-    year_pos   = year_match.start() if year_match else len(text)
+    if data.get("status") != "ok":
+        raise RuntimeError(f"YTS API error: {data.get('status_message')}")
 
-    stop_match = _STOP_RE.search(text)
-    stop_pos   = stop_match.start() if stop_match else len(text)
+    movies = []
+    for m in data["data"].get("movies") or []:
+        movies.append({
+            "title":       m.get("title", ""),
+            "year":        str(m.get("year", "")),
+            "imdb_id":     m.get("imdb_code", ""),
+            "imdb_rating": str(m.get("rating", "N/A")),
+            "genre":       ", ".join(m.get("genres") or []),
+        })
+    return movies
 
-    cut   = min(year_pos, stop_pos)
-    title = re.sub(r"\s+", " ", text[:cut]).strip()
+# ── OMDB enrichment (fills in missing ratings / genre) ───────────────────────
 
-    if not title:                          # nothing was cut — take first 5 words
-        title = " ".join(text.split()[:5])
-
-    return title, year
-
-# ── Scraping ──────────────────────────────────────────────────────────────────
-
-_LOCAL_CHROMEDRIVER = "/tmp/chromedriver-mac-x64/chromedriver"
-COOKIES_FILE        = ".cf_cookies.json"
-
-
-def _find_chromedriver() -> Optional[str]:
-    """Return chromedriver path: local Mac binary → system PATH → None (uc auto-download)."""
-    if os.path.exists(_LOCAL_CHROMEDRIVER):
-        return _LOCAL_CHROMEDRIVER
-    return shutil.which("chromedriver")   # set by browser-actions/setup-chrome in CI
-
-
-def _make_driver(headless: bool) -> uc.Chrome:
-    options = uc.ChromeOptions()
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1280,800")
-    kwargs: Dict = {"options": options, "use_subprocess": True, "headless": headless}
-    driver_path = _find_chromedriver()
-    if driver_path:
-        kwargs["driver_executable_path"] = driver_path
-    return uc.Chrome(**kwargs)
-
-
-def _cf_resolved(driver: uc.Chrome) -> bool:
-    t = driver.title.lower()
-    return "moment" not in t and "checking" not in t and "verify" not in t
-
-
-def _wait_cf(driver: uc.Chrome, timeout: int = 35) -> bool:
-    """Return True if Cloudflare cleared within timeout seconds."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if _cf_resolved(driver):
-            time.sleep(1.5)   # settle
-            return True
-        time.sleep(1)
-    return False
-
-
-def _load_cookies() -> List[Dict]:
-    if os.path.exists(COOKIES_FILE):
-        with open(COOKIES_FILE) as f:
-            return json.load(f)
-    return []
-
-
-def _save_cookies(driver: uc.Chrome) -> None:
-    with open(COOKIES_FILE, "w") as f:
-        json.dump(driver.get_cookies(), f)
-
-
-def scrape_titles(url: str) -> List[str]:
-    """
-    Fetch 1337x movie listing.
-    - If saved Cloudflare cookies exist: tries headless first (no window).
-    - If cookies are missing or expired: opens a visible Chrome window once,
-      waits for the human/auto challenge to pass, then saves cookies for
-      all future headless runs.
-    """
-    base_url    = "/".join(url.split("/")[:3])
-    saved       = _load_cookies()
-    html        = ""
-
-    for headless in ([True, False] if saved else [False]):
-        driver = _make_driver(headless)
-        try:
-            # Inject saved cookies before hitting the target page
-            if saved and headless:
-                driver.get(base_url)
-                time.sleep(1)
-                for c in saved:
-                    try:
-                        driver.add_cookie(c)
-                    except Exception:
-                        pass
-
-            driver.get(url)
-
-            if not _wait_cf(driver, timeout=35):
-                print("  [!] Cloudflare not resolved in time" + (" — retrying visibly" if headless else ""))
-                continue   # fall through to visible attempt
-
-            _save_cookies(driver)
-            html = driver.page_source
-            break
-        finally:
-            driver.quit()
-
-    if not html:
-        raise RuntimeError("Could not scrape page — Cloudflare challenge not resolved.")
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Locate the "Most Popular Torrents" block on the homepage
-    strong = soup.find("strong", string=lambda t: t and "Most Popular Torrents" in t)
-    if not strong:
-        raise RuntimeError("Could not find 'Most Popular Torrents' section on page.")
-    featured = strong.parent.parent   # div.featured-list
-
-    titles = []
-    for td in featured.select("td.name"):
-        links = td.find_all("a")
-        if len(links) < 2:
-            continue
-        icon_href = links[0].get("href", "")
-        # Skip TV shows, keep only movies
-        if "/sub/movies/" not in icon_href:
-            continue
-        titles.append(links[1].get_text(strip=True))
-    return titles
-
-# ── OMDB lookup ───────────────────────────────────────────────────────────────
-
-def get_omdb_info(title: str, year: Optional[str]) -> Dict:
-    """Query OMDB API. Returns a dict with imdb_rating, imdb_id, genre, year."""
-    params: dict = {"t": title, "apikey": OMDB_API_KEY}
-    if year:
-        params["y"] = year
+def enrich_with_omdb(movie: Dict) -> Dict:
+    """Query OMDB by IMDb ID to get accurate rating and genre."""
+    if not movie["imdb_id"]:
+        return movie
     try:
         data = requests.get(
-            "https://www.omdbapi.com/", params=params, timeout=10
+            "https://www.omdbapi.com/",
+            params={"i": movie["imdb_id"], "apikey": OMDB_API_KEY},
+            headers=HEADERS,
+            timeout=10,
         ).json()
         if data.get("Response") == "True":
-            return {
-                "imdb_rating": data.get("imdbRating", "N/A"),
-                "imdb_id":     data.get("imdbID", ""),
-                "genre":       data.get("Genre", ""),
-                "year":        data.get("Year", year or ""),
-            }
+            movie["imdb_rating"] = data.get("imdbRating", movie["imdb_rating"])
+            movie["genre"]       = data.get("Genre",      movie["genre"])
     except Exception:
         pass
-    return {"imdb_rating": "N/A", "imdb_id": "", "genre": "", "year": year or ""}
+    return movie
 
 # ── HTML email ────────────────────────────────────────────────────────────────
 
@@ -234,12 +97,12 @@ def _rating_color(rating: str) -> str:
     try:
         r = float(rating)
         if r >= 7.0:
-            return "#27ae60"   # green
+            return "#27ae60"
         if r >= 5.0:
-            return "#e67e22"   # orange
-        return "#e74c3c"       # red
+            return "#e67e22"
+        return "#e74c3c"
     except ValueError:
-        return "#888888"       # grey for N/A
+        return "#888888"
 
 
 def build_html(movies: List[Dict]) -> str:
@@ -272,9 +135,9 @@ def build_html(movies: List[Dict]) -> str:
               box-shadow:0 2px 12px rgba(0,0,0,.12);overflow:hidden;">
 
     <div style="background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);padding:28px 32px;">
-      <h1 style="margin:0;color:#e94560;font-size:22px;">&#127909; Movies on 1337x</h1>
+      <h1 style="margin:0;color:#e94560;font-size:22px;">&#127909; Popular Movies This Week</h1>
       <p style="margin:6px 0 0;color:#aaa;font-size:13px;">
-        Latest torrents &mdash; IMDb ratings via OMDB &mdash; sorted by rating
+        Most active torrents on YTS &mdash; IMDb ratings &mdash; sorted by rating
       </p>
     </div>
 
@@ -295,7 +158,7 @@ def build_html(movies: List[Dict]) -> str:
 
     <div style="padding:14px 24px;background:#f9f9f9;border-top:1px solid #eee;
                 font-size:11px;color:#bbb;text-align:center;">
-      Generated automatically &middot; Data from OMDB API
+      Generated automatically &middot; Source: YTS &middot; Ratings: IMDb via OMDB
     </div>
   </div>
 </body>
@@ -303,7 +166,7 @@ def build_html(movies: List[Dict]) -> str:
 
 # ── Email sending ─────────────────────────────────────────────────────────────
 
-def send_email(html: str, subject: str = "🎬 Weekly Movie Ratings") -> None:
+def send_email(html: str, subject: str = "🎬 Popular Movies This Week") -> None:
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"]    = EMAIL_FROM
@@ -321,32 +184,22 @@ def send_email(html: str, subject: str = "🎬 Weekly Movie Ratings") -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    print(f"Scraping: {SCRAPE_URL}")
-    raw_titles = scrape_titles(SCRAPE_URL)
-    print(f"  Found {len(raw_titles)} torrents\n")
+    print("Fetching popular movies from YTS...")
+    movies = fetch_popular_movies()
+    print(f"  Got {len(movies)} movies\n")
 
-    movies = []
-    for raw in raw_titles:
-        title, year = clean_title(raw)
-        print(f"  [{year or '????'}] {title!r}  ←  {raw[:60]}")
-        info = get_omdb_info(title, year)
-        movies.append({
-            "raw":         raw,
-            "title":       title,
-            "year":        info["year"] or "—",
-            "imdb_rating": info["imdb_rating"],
-            "imdb_id":     info["imdb_id"],
-            "genre":       info["genre"],
-        })
+    print("Enriching with OMDB ratings...")
+    for m in movies:
+        print(f"  {m['title']} ({m['year']})  imdb_id={m['imdb_id']}")
+        enrich_with_omdb(m)
         time.sleep(OMDB_DELAY)
 
-    # Sort: rated movies first (highest score → lowest), then N/A at end
     movies.sort(key=lambda m: (
-        m["imdb_rating"] == "N/A",
-        -float(m["imdb_rating"]) if m["imdb_rating"] != "N/A" else 0,
+        m["imdb_rating"] in ("N/A", "0.0", ""),
+        -float(m["imdb_rating"]) if m["imdb_rating"] not in ("N/A", "0.0", "") else 0,
     ))
 
-    print("\nBuilding email HTML...")
+    print("\nBuilding email...")
     html = build_html(movies)
 
     with open("preview.html", "w", encoding="utf-8") as f:
