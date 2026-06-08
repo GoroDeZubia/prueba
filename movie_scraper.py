@@ -7,6 +7,7 @@ and sends an HTML email with a sorted results table.
 import json
 import os
 import re
+import shutil
 import time
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -28,9 +29,9 @@ OMDB_API_KEY = os.environ["OMDB_API_KEY"]
 SMTP_HOST  = "smtp.gmail.com"
 SMTP_PORT  = 587
 SMTP_USER  = os.environ["GMAIL_USER"]
-SMTP_PASS  = os.environ["GMAIL_APP_PASS"].replace("\xa0", " ").strip()
+SMTP_PASS  = (os.environ.get("GMAIL_APP_PASS") or os.environ.get("GMAIL_PASSWORD", "")).replace("\xa0", " ").strip()
 EMAIL_FROM = SMTP_USER
-EMAIL_TO   = os.environ["EMAIL_TO"]
+EMAIL_TO   = os.environ.get("EMAIL_TO") or SMTP_USER
 
 OMDB_DELAY = 0.3   # seconds between requests (free tier: 1 000 req/day)
 
@@ -93,22 +94,28 @@ def clean_title(raw: str) -> Tuple[str, Optional[str]]:
 
 # ── Scraping ──────────────────────────────────────────────────────────────────
 
-CHROMEDRIVER_PATH = "/tmp/chromedriver-mac-x64/chromedriver"
-COOKIES_FILE      = ".cf_cookies.json"
+_LOCAL_CHROMEDRIVER = "/tmp/chromedriver-mac-x64/chromedriver"
+COOKIES_FILE        = ".cf_cookies.json"
+
+
+def _find_chromedriver() -> Optional[str]:
+    """Return chromedriver path: local Mac binary → system PATH → None (uc auto-download)."""
+    if os.path.exists(_LOCAL_CHROMEDRIVER):
+        return _LOCAL_CHROMEDRIVER
+    return shutil.which("chromedriver")   # set by browser-actions/setup-chrome in CI
 
 
 def _make_driver(headless: bool) -> uc.Chrome:
     options = uc.ChromeOptions()
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1280,800")
-    return uc.Chrome(
-        options=options,
-        driver_executable_path=CHROMEDRIVER_PATH,
-        use_subprocess=True,
-        version_main=148,
-        headless=headless,
-    )
+    kwargs: Dict = {"options": options, "use_subprocess": True, "headless": headless}
+    driver_path = _find_chromedriver()
+    if driver_path:
+        kwargs["driver_executable_path"] = driver_path
+    return uc.Chrome(**kwargs)
 
 
 def _cf_resolved(driver: uc.Chrome) -> bool:
